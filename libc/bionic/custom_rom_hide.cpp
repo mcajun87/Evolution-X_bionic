@@ -33,6 +33,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/system_properties.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <private/android_filesystem_config.h>
 #include <private/bionic_lock.h>
@@ -525,11 +526,53 @@ static bool resolve_fd_path(int fd, char* buf, size_t size) {
     return false;
 }
 
+static ssize_t safe_copy_string(const char* addr, char* buf, size_t size) {
+    if (!addr || size == 0) return -1;
+
+    int saved_errno = errno;
+    ssize_t result = -1;
+
+    size_t page = static_cast<size_t>(getpagesize());
+    if (page == 0) page = 4096;
+
+    size_t len = 0;
+    const size_t max = size - 1;
+
+    while (len < max) {
+        uintptr_t cur = reinterpret_cast<uintptr_t>(addr) + len;
+        size_t chunk = page - (cur % page);
+        if (chunk > max - len) chunk = max - len;
+
+        struct iovec local = { buf + len, chunk };
+        struct iovec remote = {
+            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + len), chunk };
+        ssize_t n = syscall(__NR_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
+        if (n < 0) goto out;
+
+        char* nul = static_cast<char*>(memchr(buf + len, '\0', static_cast<size_t>(n)));
+        if (nul) {
+            result = static_cast<ssize_t>(nul - buf);
+            goto out;
+        }
+
+        len += static_cast<size_t>(n);
+        if (static_cast<size_t>(n) < chunk) {
+            goto out;
+        }
+    }
+out:
+    errno = saved_errno;
+    return result;
+}
+
 bool custom_rom_hide_should_block(const char* path) {
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return false;
-    if (path[0] != '/') return false;
     if (!is_app_process()) return false;
-    return is_rom_path(path);
+
+    char local[512];
+    if (safe_copy_string(path, local, sizeof(local)) < 0) return false;
+    if (local[0] != '/') return false;
+    return is_rom_path(local);
 }
 
 bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
@@ -539,13 +582,19 @@ bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
     int saved_errno = errno;
     bool result = false;
 
-    if (path[0] == '/') {
-        result = is_rom_path(path);
+    char local[512];
+    if (safe_copy_string(path, local, sizeof(local)) < 0) {
+        errno = saved_errno;
+        return false;
+    }
+
+    if (local[0] == '/') {
+        result = is_rom_path(local);
     } else if (dirfd != AT_FDCWD) {
-        size_t plen = strlen(path);
-        bool candidate = plen > 0 && path[plen - 1] == '/';
+        size_t plen = strlen(local);
+        bool candidate = plen > 0 && local[plen - 1] == '/';
         if (!candidate) {
-            const char* base = path_basename(path);
+            const char* base = path_basename(local);
             for (const char* const* dn = kBlockedDirnames; *dn; ++dn) {
                 if (strcmp(base, *dn) == 0) { candidate = true; break; }
             }
@@ -554,8 +603,8 @@ bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
         if (candidate) {
             char dir_path[256];
             if (resolve_fd_path(dirfd, dir_path, sizeof(dir_path))) {
-                char full_path[512];
-                int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, path);
+                char full_path[512 + 256 + 1];
+                int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, local);
                 if (n > 0 && static_cast<size_t>(n) < sizeof(full_path)) {
                     result = is_rom_path(full_path);
                 }
@@ -573,6 +622,12 @@ bool custom_rom_hide_is_symlink(const char* path) {
     bool result = raw_fstatat(AT_FDCWD, path, &sb, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(sb.st_mode);
     errno = saved_errno;
     return result;
+}
+
+bool custom_rom_hide_is_empty_path(const char* path) {
+    if (!path) return true;
+    char local[2];
+    return safe_copy_string(path, local, sizeof(local)) == 0;
 }
 
 bool custom_rom_hide_should_filter_dirent(int dirfd, const char* name) {
@@ -727,7 +782,7 @@ ssize_t custom_rom_hide_readlinkat_post(int dirfd, const char* path, char* buf,
 }
 
 enum ProcFilterType {
-    PROC_FILTER_NONE, PROC_FILTER_MAPS, PROC_FILTER_MOUNTS,
+    PROC_FILTER_NONE, PROC_FILTER_MAPS, PROC_FILTER_SMAPS, PROC_FILTER_MOUNTS,
     PROC_FILTER_MOUNTINFO, PROC_FILTER_FILESYSTEMS, PROC_FILTER_CMDLINE,
 };
 
@@ -752,7 +807,8 @@ static ProcFilterType get_proc_filter_type(const char* path) {
     const char* leaf_base = strrchr(leaf, '/');
     leaf_base = leaf_base ? leaf_base + 1 : leaf;
 
-    if (strcmp(leaf_base, "maps") == 0 || strcmp(leaf_base, "smaps") == 0) return PROC_FILTER_MAPS;
+    if (strcmp(leaf_base, "maps") == 0) return PROC_FILTER_MAPS;
+    if (strcmp(leaf_base, "smaps") == 0) return PROC_FILTER_SMAPS;
     if (strcmp(leaf_base, "mounts") == 0) return PROC_FILTER_MOUNTS;
     if (strcmp(leaf_base, "mountinfo") == 0) return PROC_FILTER_MOUNTINFO;
 
@@ -976,6 +1032,24 @@ static bool drop_proc_line(const char* line, void* ctx) {
     return should_filter_line(*static_cast<ProcFilterType*>(ctx), line);
 }
 
+static bool is_smaps_header(const char* line) {
+    if (line[0] == '\0') return false;
+    return (line[0] >= '0' && line[0] <= '9') || (line[0] >= 'a' && line[0] <= 'f');
+}
+
+struct SmapsFilterCtx {
+    bool dropping;
+};
+
+static bool drop_smaps_line(const char* line, void* raw_ctx) {
+    SmapsFilterCtx* ctx = static_cast<SmapsFilterCtx*>(raw_ctx);
+    if (is_smaps_header(line)) {
+        ctx->dropping = line_has_blocked_segment(line);
+        return ctx->dropping;
+    }
+    return ctx->dropping;
+}
+
 int custom_rom_hide_filter_proc(const char* path) {
     if (!is_app_process()) return -1;
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
@@ -983,6 +1057,13 @@ int custom_rom_hide_filter_proc(const char* path) {
     int saved_errno = errno;
     ProcFilterType type = get_proc_filter_type(path);
     if (type == PROC_FILTER_NONE) { errno = saved_errno; return -1; }
+
+    if (type == PROC_FILTER_SMAPS) {
+        SmapsFilterCtx ctx = {};
+        int mem_fd = filter_file_with(path, drop_smaps_line, write_line_raw, &ctx);
+        errno = saved_errno;
+        return mem_fd;
+    }
 
     if (type != PROC_FILTER_CMDLINE) {
         LineWriter writer = (type == PROC_FILTER_MOUNTS || type == PROC_FILTER_MOUNTINFO)
@@ -1383,8 +1464,10 @@ bool custom_rom_hide_is_app_process() {
 
 static const PartitionDevEntry* find_partition_entry(const char* path) {
     if (!path) return nullptr;
+    char local[32];
+    if (safe_copy_string(path, local, sizeof(local)) < 0) return nullptr;
     for (const PartitionDevEntry* e = kPartitionDmMap; e->path; ++e) {
-        if (strcmp(path, e->path) == 0) return e;
+        if (strcmp(local, e->path) == 0) return e;
     }
     return nullptr;
 }
